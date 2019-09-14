@@ -1,0 +1,7 @@
+main :: IO ()
+main = runResourceT $ run $ do
+  as <- getArgs
+  name <- getInvokedName
+  case as of
+    [depmod, kernelRelease] ->
+    _ -> echo ("Usage: " <> name <> " /sbin/depmod <kernelrelease>") |> err

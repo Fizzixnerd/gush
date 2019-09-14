@@ -1,0 +1,21 @@
+module Main where
+
+import Gush
+
+main :: IO ()
+main = runResourceT $ run $ do
+  let doc = [here|
+#include <stdio.h>
+int main(void)
+{
+  printf("");
+  return 0;
+}
+|]
+  as <- getArgs
+  case as of
+    [] -> echo "the command requires at least one argument"
+    (cmd : rest) ->
+      doc
+      |> proc cmd (rest <> words "-x c - -o /dev/null")
+      |> sinkFile "/dev/null"
