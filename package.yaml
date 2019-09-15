@@ -28,8 +28,9 @@ library:
   - lens
   - text
   - bytestring
-  - conduit
-  - shell-conduit
+  - typed-process
+  - process
+  - resourcet
   - Glob >= 0.10.0 && < 0.11.0
 
 executables:
