@@ -3,6 +3,9 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ExtendedDefaultRules #-}
+{-# LANGUAGE Arrows #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Lib
     (
@@ -15,11 +18,22 @@ import System.FilePath.Glob (Pattern, globDir1)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Resource
 import Control.Monad (void)
-import System.IO (withBinaryFile, IOMode(..), Handle, stdin, stdout, stderr, hClose, openFile, hFlush)
+import System.IO (withBinaryFile, IOMode(..), Handle, stdin, stdout, stderr, hClose, openFile, hFlush, hPutStrLn)
 import Control.Category
 import Control.Arrow
+import Debug.Trace
+import Data.Vector (Vector)
+import qualified Data.Vector as V
+import System.Directory
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as Utf
+import Data.String
 
 data Handles = Handles Handle Handle Handle
+
+-- newtype GushT m a =
+--   GushT { unGushT :: StateT Handles  }
 
 newtype Pipeline m i o =
   Pipeline ((i, Handles) -> m (o, Handles))
@@ -33,56 +47,71 @@ instance Monad m => Category (Pipeline m) where
 instance Monad m => Arrow (Pipeline m) where
   arr f = Pipeline $ \(x, handles) -> return (f x, handles)
   first (Pipeline f) = Pipeline $ \((x, y), handles) -> do
-    (z, handles') <- f (x, handles)
-    return ((z, y), handles')
+    (z, handles'') <- f (x, handles)
+    return ((z, y), handles'')
 
-exec :: Functor m => Pipeline m () o -> m o
-exec (Pipeline f) = fst <$> f ((), Handles stdin stdout stderr)
+instance (Monad m, IsString s) => IsString (Pipeline m () s) where
+  fromString s = arr (const $ fromString s)
 
-execRes :: MonadUnliftIO m => Pipeline (ResourceT m) () a -> m a
-execRes = runResourceT . exec
+liftP :: Monad m => (a -> m b) -> Pipeline m a b
+liftP f = Pipeline $ \(x, handles) -> do
+  x <- f x
+  return (x, handles)
 
-exec' :: Functor m => Pipeline m i o -> i -> m o
-exec' (Pipeline f) x = fst <$> f (x, Handles stdin stdout stderr)
+exec' :: MonadIO m => Pipeline m () o -> m o
+exec' (Pipeline f) = fst <$> f ((), Handles stdin stdout stderr)
 
-execWith :: Functor m => Pipeline m i o -> i -> Handles -> m o
-execWith (Pipeline f) x handles = fst <$> f (x, handles)
+exec :: MonadUnliftIO m => Pipeline (ResourceT m) () a -> m a
+exec = runResourceT . exec'
 
 -- | The flip of this cannot be made the definition of (.) because
--- it would violate the identity law.  Also, the pipes are not closed here;
--- include resourcet and close them!
+-- it would violate the identity law.
 (|>) :: MonadResource m => Pipeline m a b -> Pipeline m b c -> Pipeline m a c
-(Pipeline f) |> (Pipeline g) = Pipeline $ \(x, Handles in1 out1 err1) -> do
-  (releaseKey, (pipeOut, pipeIn)) <- allocate SP.createPipe $ \(pin, pout) -> do
-    hClose pin
-    hClose pout
-  (y, Handles in2 out2 err2) <- f (x, Handles in1 pipeIn err1)
-  (z, Handles in3 out3 err3) <- g (y, Handles pipeOut out1 err1)
-  release releaseKey
-  return (z, Handles in1 out1 err1)
-
--- cmd :: (MonadUnliftIO m, MonadResource m) => String -> [String] -> Pipeline m () ()
--- cmd name args =
---   Pipeline $ \((), Handles hin hout herr) -> do
---     (releaseKey, process) <-
---       allocate
---         (SPT.startProcess
---           (SPT.setStdin (SPT.useHandleOpen hin) $
---            SPT.setStdout (SPT.useHandleOpen hout) $
---            SPT.setStderr (SPT.useHandleOpen herr) $
---            SPT.proc name args))
---         SPT.stopProcess
---     return ((), Handles hin hout herr)
+f |> g = proc x -> do
+  Handles hin hout herr <- getHandles -< ()
+  (pipeOut, pipeIn) <- liftP $ liftIO . const SP.createPipe -< ()
+  () <- setHandles -< Handles hin pipeIn herr
+  y <- f -< x
+  () <- liftP $ liftIO . hClose -< pipeIn
+  () <- setHandles -< Handles pipeOut hout herr
+  z <- g -< y
+  () <- liftP $ liftIO . hClose -< pipeOut
+  () <- setHandles -< Handles hin hout herr
+  returnA -< z
 
 cmd :: (MonadUnliftIO m, MonadResource m) => String -> [String] -> Pipeline m () ()
 cmd name args =
   Pipeline $ \((), Handles hin hout herr) -> do
-    SPT.withProcessWait
-      (SPT.setStdin (SPT.useHandleOpen hin) $
-       SPT.setStdout (SPT.useHandleOpen hout) $
-       SPT.setStderr (SPT.useHandleOpen herr) $
-       SPT.proc name args)
-      (const $ return ((), Handles hin hout herr))
+    (_, process) <-
+      allocate
+        (SPT.startProcess
+          (SPT.setStdin (SPT.useHandleOpen hin) $
+           SPT.setStdout (SPT.useHandleOpen hout) $
+           SPT.setStderr (SPT.useHandleOpen herr) $
+           SPT.proc name args))
+        (void . SPT.waitExitCode)
+    return ((), Handles hin hout herr)
+
+-- cmd :: (MonadUnliftIO m, MonadResource m) => String -> [String] -> Pipeline m () ()
+-- cmd name args =
+--   Pipeline $ \((), Handles hin hout herr) -> do
+--     SPT.withProcessWait
+--       (SPT.setStdin (SPT.useHandleOpen hin) $
+--        SPT.setStdout (SPT.useHandleOpen hout) $
+--        SPT.setStderr (SPT.useHandleOpen herr) $
+--        SPT.proc name args)
+--       (const $ return ((), Handles hin hout herr))
+
+-- cmd :: (MonadUnliftIO m, MonadResource m) => String -> [String] -> Pipeline m () ()
+-- cmd name args =
+--   Pipeline $ \((), Handles hin hout herr) -> do
+--     void $
+--       SPT.startProcess $
+--       SPT.setStdin (SPT.useHandleOpen hin) $
+--       SPT.setStdout (SPT.useHandleOpen hout) $
+--       SPT.setStderr (SPT.useHandleOpen herr) $
+--       SPT.proc name args
+--     return ((), Handles hin hout herr)
 
 captureIn :: MonadResource m => FilePath -> Pipeline m a a
 captureIn fp =
@@ -93,11 +122,31 @@ captureIn fp =
 (|>>) :: MonadResource m => Pipeline m i o -> FilePath -> Pipeline m i o
 p |>> fp = captureIn fp >>> p
 
+getHandles :: Monad m => Pipeline m i Handles
+getHandles = Pipeline $ \(_, handles) -> return (handles, handles)
+
+setHandles :: Monad m => Pipeline m Handles ()
+setHandles = Pipeline $ \(handles, _) -> return ((), handles)
+
 ls :: (MonadUnliftIO m, MonadResource m) => Pipeline m () ()
 ls = cmd "ls" ["--color=auto"]
 
+echo :: MonadIO m => Pipeline m ByteString ()
+echo = proc bs -> do
+  Handles _ hout _ <- getHandles -< ()
+  liftP $ liftIO . uncurry BS.hPutStr -< (hout, bs)
+
+ls' :: MonadIO m => Pipeline m FilePath [FilePath]
+ls' = proc fp -> do
+  contents <- liftP $ liftIO . listDirectory -< fp
+  echo -< (BS.intercalate "\n" $ Utf.pack <$> contents) <> "\n"
+  returnA -< contents
+
+testPipe2 :: (MonadUnliftIO m, MonadResource m) => Pipeline m () [FilePath]
+testPipe2 = "." |> ls'
+
 testPipe :: (MonadUnliftIO m, MonadResource m) => Pipeline m () ()
-testPipe = ls |> cmd "cat" []
+testPipe = ls |> cmd "cat" [] |> cmd "cat" []
 
 {-
   Law checking:
